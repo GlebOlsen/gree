@@ -1,7 +1,7 @@
 import std/[os, terminal, strutils, sequtils, algorithm, unicode, math]
-when defined(posix): import std/posix
 
 when defined(posix):
+  import std/posix
   proc wcwidth(c: cint): cint {.importc, header: "<wchar.h>".}
   discard setlocale(LC_CTYPE, "")
 
@@ -31,6 +31,7 @@ var maxDepth = 8
 var budget = 0
 var seen = 0
 var pending = 1
+var rootHidden = 0
 var Gap = 3
 var W, H: int
 var grid: seq[seq[string]]
@@ -46,6 +47,7 @@ var lines = 0
 var color = stdout.isatty
 
 proc clean(s: string): string =
+  if s.allCharsInSet({' ' .. '~'}): return s
   for r in s.runes:
     if r.int < 0x20 or r.int in 0x7f .. 0x9f: result.add '?'
     else: result.add $r
@@ -62,16 +64,15 @@ proc dirsFirst(a, b: Node): int =
 proc load(n: Node) =
   if n.loaded or not n.isDir: return
   n.loaded = true
-  if n.depth < maxDepth: dec pending
+  let deep = n.depth >= maxDepth
+  if not deep: dec pending
   try:
-    if n.depth >= maxDepth:
-      for _ in walkDir(n.path, checkDir = true): (n.cut = true; break)
-      return
     for kind, p in walkDir(n.path, checkDir = true):
       let name = p.extractFilename
       if name[0] == '.' and not all: continue
+      if deep: (n.cut = true; break)
       let c = Node(name: clean(name), path: p, isDir: kind == pcDir,
-                   total: (if kind == pcDir: 0 else: 1), depth: n.depth + 1)
+                   total: ord(kind != pcDir), depth: n.depth + 1)
       if kind in {pcLinkToDir, pcLinkToFile}:
         c.isLink = true
         try: c.link = clean(expandSymlink(p))
@@ -107,10 +108,8 @@ proc kids(n: Node): seq[Node] =
 
 proc hidden(n: Node): int =
   if not showHidden or not n.isDir: return 0
-  result = n.total
-  for c in n.kids:
-    if c.more == 0: result -= c.total
-  result = max(result, 0)
+  if n.depth == 0: return rootHidden
+  max(n.total - n.kids.mapIt(it.total).sum, 0)
 
 const
   DirColor = ansiStyleCode(styleBright) & ansiForegroundColorCode(fgBlue)
@@ -122,31 +121,31 @@ const
   BadColor = ansiStyleCode(styleBright) & ansiForegroundColorCode(fgRed)
   NumColor = ansiForegroundColorCode(fgYellow, bright = true)
 
-proc tag(n: Node, dir: int): (string, string) =
+proc tag(n: Node, dir: int): string =
   let hidden = n.hidden
-  if hidden > 0: ((if dir > 0: "+" & $hidden else: $hidden & "+"), NumColor)
-  elif n.denied: ("[denied]", BadColor)
-  else: ("", "")
+  if hidden > 0: (if dir > 0: "+" & $hidden else: $hidden & "+") else: ""
 
 proc dirName(n: Node): string =
-  if plain and not color and not n.name.endsWith('/'): n.name & "/" else: n.name
+  if plain and not color and not n.name.endsWith('/'): n.name & (if n.denied: "!" else: "/") else: n.name
 
 proc label(n: Node): string =
   if n.more > 0: return "+" & $n.more & " more"
   if n.isLink: return n.name & (if plain: "->" else: "→") & n.link
-  result = n.name
-  if n.isDir:
-    result = n.dirName
-    let (text, _) = n.tag(1)
-    if text.len > 0: result &= " " & text
-    if not plain: result &= "  "
+  if not n.isDir: return n.name
+  result = n.dirName
+  let text = n.tag(1)
+  if text.len > 0: result &= " " & text
+  if not plain: result &= "  "
 
 proc width(n: Node): int = n.label.cellWidth
+
+proc ellipsis(): seq[string] =
+  if plain: @[".", ".", "."] else: @["…"]
 
 proc shownLeaves(n: Node): int =
   if n.more > 0: return 0
   if n.isDir: return n.kids.mapIt(it.shownLeaves).sum
-  let dots = if plain: 3 else: 1
+  let dots = ellipsis().len
   let lo = if n.x0 < 0: dots else: 0
   let hi = if n.x1 > W: W - dots else: W
   var x = n.x0
@@ -154,12 +153,8 @@ proc shownLeaves(n: Node): int =
     if x < hi and x + p.width > lo: inc result
     x += p.width + 2
 
-proc setOpen(n: Node, v: bool) =
-  n.open = v
-  for c in n.children: c.setOpen(v)
-
 proc height(n: Node): int =
-  if n.kids.len == 0: 1 else: n.kids.mapIt(it.height).foldl(a + b)
+  max(n.kids.mapIt(it.height).sum, 1)
 
 proc pack(n: Node, x: int) =
   n.packed = true
@@ -190,21 +185,19 @@ proc extent(n: Node, cols: seq[int], depth = 0): int =
   if n.kids.len == 0: return n.width
   (if dense > 0: n.width else: cols[depth]) + Gap + n.kids.mapIt(it.extent(cols, depth + 1)).max
 
-proc prep(n: Node) =
+proc closedDirs(n: Node, depth: int): seq[Node] =
+  if depth > 0:
+    for c in n.kids: result.add c.closedDirs(depth - 1)
+    return
   n.load
   if dense > 1 and n.isDir and not n.packed: n.pack(n.px)
-
-proc closedDirsAt(n: Node, depth, want: int, acc: var seq[Node]) =
-  if depth == want:
-    n.prep
-    if n.isDir and n.children.len > 0 and not n.open: acc.add n
-  else:
-    for c in n.kids: c.closedDirsAt(depth + 1, want, acc)
+  if n.isDir and n.children.len > 0 and not n.open: result.add n
 
 proc trim(n: Node, keep: int) =
-  if n.children.len > keep:
-    let cut = n.children[keep .. ^1]
-    n.children = n.children[0 ..< keep] & Node(more: cut.mapIt(max(it.parts.len, 1)).sum)
+  if n.children.len <= keep: return
+  let cut = n.children[keep .. ^1]
+  n.children.setLen(keep)
+  if not showHidden: n.children.add Node(more: cut.mapIt(max(it.parts.len, 1)).sum)
 
 proc bump(h: var seq[int], i, by: int) =
   if h.len <= i: h.setLen(i + 1)
@@ -215,7 +208,6 @@ proc top(h: seq[int]): int =
     if h[i] > 0: return i
 
 proc openToFit(n: Node, rows, width: int) =
-  if n.children.len > rows: n.trim(rows - 1)
   var colCnt: seq[seq[int]]
   var farCnt: seq[int]
   var height = n.height
@@ -234,34 +226,33 @@ proc openToFit(n: Node, rows, width: int) =
       for c in d.children:
         c.x0 = d.x1; c.x1 = d.x1 + Gap + c.width
         c.add(depth + 1, 1)
-  let cur = proc(): int =
-    if dense > 0: farCnt.top else: colCnt[1 .. ^1].mapIt(it.top).filterIt(it > 0).mapIt(it + Gap).foldl(a + b, 0)
-  let fits = proc(d: Node, depth: int): bool =
+  proc cur(): int =
+    if dense > 0: farCnt.top else: colCnt[1 .. ^1].mapIt(it.top).filterIt(it > 0).mapIt(it + Gap).sum
+  proc fits(d: Node, depth: int): bool =
+    if not unlimited and height + d.children.len - 1 > rows: return false
     let now = cur()
     d.toggle(depth, true)
-    result = (unlimited or height + d.children.len - 1 <= rows) and cur() <= max(width, now)
+    result = cur() <= max(width, now)
     if result: height += d.children.len - 1 else: d.toggle(depth, false)
   n.x1 = 0; n.add(0, 1)
   for c in n.children:
     c.x0 = 0; c.x1 = Gap + c.width
     c.add(1, 1)
   for depth in 1 .. maxDepth:
-    var cands: seq[Node]
-    n.closedDirsAt(0, depth, cands)
+    let cands = n.closedDirs(depth)
     if cands.len == 0: break
     for d in cands: discard d.fits(depth)
   for depth in 1 .. maxDepth:
-    var cands: seq[Node]
-    n.closedDirsAt(0, depth, cands)
-    for d in cands:
+    if depth >= colCnt.len: break
+    for d in n.closedDirs(depth):
       let keep = if unlimited: d.children.len
-                 else: min(d.children.len, rows - height + (if showHidden: 1 else: 0))
+                 else: min(d.children.len, rows - height + ord(showHidden))
       let saved = d.children
       var widest = newSeq[int](keep)
       for i in 0 ..< keep: widest[i] = max(saved[i].width, if i > 0: widest[i - 1] else: 0)
       for limit in countdown(keep, 1):
         if limit < keep and widest[limit - 1] == widest[limit]: continue
-        if showHidden: d.children = saved[0 ..< limit] else: d.trim(limit)
+        d.trim(limit)
         if d.fits(depth): break
         d.children = saved
 
@@ -289,8 +280,7 @@ proc typeColor(path: string, follow: bool): string =
   if not color: return ""
   when defined(posix):
     var info: Stat
-    let ok = if follow: stat(path.cstring, info) == 0 else: lstat(path.cstring, info) == 0
-    if path.len > 0 and ok:
+    if (if follow: stat(path.cstring, info) else: lstat(path.cstring, info)) == 0:
       let mode = info.st_mode
       if S_ISDIR(mode): return DirColor
       if S_ISFIFO(mode): return PipeColor
@@ -310,28 +300,25 @@ proc leafCells(n: Node, dir: int): seq[string] =
 
 proc putLabel(n: Node, dir: int) =
   var cs: seq[string]
-  if n.parts.len > 0:
-    for i, p in n.parts:
+  if not n.isDir:
+    for i, p in (if n.parts.len > 0: n.parts else: @[n]):
       if i > 0: cs.add [" ", " "]
       cs.add p.leafCells(dir)
-  elif not n.isDir:
-    cs = n.leafCells(dir)
   else:
-    let icon = if plain: @[] else: @[if n.children.len > 0 or n.cut or n.denied: "📁" else: "📂", ""]
-    let name = cells(n.dirName, DirColor)
-    let (text, code) = n.tag(dir)
-    let tag = cells(text, code)
+    let icon = if plain: @[] else: @[if n.denied: "🔒" elif n.children.len > 0 or n.cut: "📁" else: "📂", ""]
+    let name = cells(n.dirName, if plain and n.denied: BadColor else: DirColor)
+    let tag = cells(n.tag(dir), NumColor)
     cs = if tag.len == 0: (if dir > 0: icon & name else: name & icon)
          elif dir > 0: icon & name & @[" "] & tag
          else: tag & @[" "] & name & icon
-  let dots = cells(if plain: "..." else: "…", "")
+  let dots = ellipsis()
   var x = n.x0
   if x + cs.len > W:
     let keep = max(W - x - dots.len, 0)
     if keep > 0 and cs[keep].len == 0: cs[keep - 1] = " "
     cs = cs[0 ..< keep] & dots
     if color: cs[^1] &= ansiResetCode
-  elif x < 0:
+  elif x < 0 and x + cs.len > 0:
     let start = min(dots.len - x, cs.len)
     if start < cs.len and cs[start].len == 0: cs[start] = " "
     var code = ""
@@ -344,7 +331,7 @@ proc putLabel(n: Node, dir: int) =
       if k > 0: code = c[0 ..< k]
       if c.endsWith(ansiResetCode): code = ""
     if start < cs.len: cs[start] = code & cs[start]
-    cs = dots & cs[start .. ^1]
+    cs = dots[0 ..< min(dots.len, x + cs.len)] & cs[start .. ^1]
     if color: cs[^1] &= ansiResetCode
     x = 0
   for i, c in cs: put(x + i, n.y, c)
@@ -368,21 +355,19 @@ proc draw(n: Node, dir: int) =
   let cx = if dir > 0: n.kids[0].x0 - 2 else: n.kids[0].x1 + 1
   let (first, last, branch, stem) =
     if dir > 0: ("┌", "└", "├", "┤") else: ("┐", "┘", "┤", "├")
-  for y in y0 .. y1:
-    put(cx, y, if y0 == y1: "─"
-               elif y == y0: first
-               elif y == y1: last
-               elif y in rows: branch
-               else: "│")
-  if y0 != y1:
-    put(cx, n.y, if n.y == y0: (if n.y in rows: "┬" elif dir > 0: "┐" else: "┌")
-                 elif n.y == y1: (if n.y in rows: "┴" elif dir > 0: "┘" else: "└")
-                 elif n.y in rows: "┼"
-                 else: stem)
+  for y in y0 .. y1: put(cx, y, "│")
+  for y in rows: put(cx, y, branch)
+  put(cx, y0, first); put(cx, y1, last)
+  let joins = n.y in rows
+  put(cx, n.y, if y0 == y1: "─"
+               elif n.y == y0: (if joins: "┬" elif dir > 0: "┐" else: "┌")
+               elif n.y == y1: (if joins: "┴" elif dir > 0: "┘" else: "└")
+               elif joins: "┼"
+               else: stem)
   let (sx0, sx1) = if dir > 0: (n.x1, cx - 1) else: (cx + 1, n.x0 - 1)
   for x in sx0 .. sx1: put(x, n.y, "─")
   for c in n.kids:
-    put((if dir > 0: c.x0 - 1 else: c.x1), c.y, "─")
+    put(cx + dir, c.y, "─")
     c.putLabel(dir)
     c.draw(dir)
 
@@ -402,6 +387,7 @@ Display
   -dd also packs sibling files side by side on shared rows
   -n  show +N after each folder for the number of files under it that are not displayed
   -p  plain: no folder emoji, folders are told apart by color, or end with / without color
+      (a folder that cannot be read is red, or ends with ! without color)
   -a  include hidden entries (names starting with a dot)
   -u  unlimited height: show everything the width allows, for piping into less or a file
       (no width limit when there is no terminal)
@@ -427,11 +413,8 @@ proc parseArgs(): (int, string) =
         let ch = a[j]
         if ch in {'H', 'L'}:
           let v = if j + 1 < a.len: a[j + 1 .. ^1] else: (if i < args.len: (inc i; args[i - 1]) else: "")
-          var num = 0
-          try: num = v.parseInt
-          except ValueError: discard
-          if num < 1:
-            fail "-", ch, " needs a number"
+          let num = try: v.parseInt except ValueError: 0
+          if num < 1: fail "-", ch, " needs a number"
           if ch == 'H': lines = num else: maxDepth = num
           break
         case ch
@@ -452,52 +435,49 @@ proc parseArgs(): (int, string) =
           fail "unknown option -", ch
     else: result[1] = a
 
-proc splitBalanced(tree: Node, cap: int): (Node, Node) =
-  var left = Node(name: tree.name, isDir: true, open: true)
-  var right = Node(name: tree.name, isDir: true, open: true)
+proc leftCount(tree: Node, cap: int): int =
   let hs = tree.children.mapIt(it.reach(cap))
   let total = hs.sum
   var acc = 0
-  for i, c in tree.children:
-    if right.children.len == 0 and 2 * acc + hs[i] < total:
-      left.children.add c; acc += hs[i]
-    else: right.children.add c
-  (left, right)
+  for h in hs:
+    if 2 * acc + h >= total: break
+    acc += h; inc result
 
 proc main() =
   let (side, root) = parseArgs()
   var path = root.absolutePath.normalizedPath.strip(leading = false, chars = {'/'})
   if path.len == 0: path = "/"
   if not dirExists(path): fail "not a directory: ", clean(root)
-  let name = if root == ".": getCurrentDir().extractFilename else: path.extractFilename
-  let tree = Node(name: clean(name), path: path, isDir: true)
+  let tree = Node(name: clean(path.extractFilename), path: path, isDir: true, open: true)
   if tree.name.len == 0: tree.name = path
-  let th = terminalHeight()
   if lines > 0: unlimited = false
   let wide = unlimited and not (stdin.isatty or stdout.isatty or stderr.isatty) and
              not existsEnv("COLUMNS")
   W = terminalWidth()
-  let termH = (if th > 0: th else: 24) - (if showInfo: 3 else: 2)
-  let rows = if unlimited: int.high div 2 elif lines > 0: lines - (if showInfo: 1 else: 0) else: termH
+  let info = ord(showInfo)
+  let th = terminalHeight()
+  let termH = (if th > 0: th else: 24) - 2 - info
+  let rows = if unlimited: int.high div 2 elif lines > 0: lines - info else: termH
   if rows < 1:
-    fail if lines > 0: "-H must be at least " & $(if showInfo: 2 else: 1) else: "terminal too small"
+    fail if lines > 0: "-H must be at least " & $(1 + info) else: "terminal too small"
   if showHidden: tree.loadAll else: tree.load
   if tree.denied: fail "permission denied: ", clean(root)
-  tree.setOpen(true)
-  let rootLen = tree.width
 
+  proc sideOf(kids: seq[Node]): Node =
+    Node(name: tree.name, isDir: true, open: true, children: kids)
+  let mid = if side == 0: tree.leftCount(max(rows div 4, 1)) else: 0
   var sides: seq[(Node, int)]
-  if side == 0:
-    let (left, right) = tree.splitBalanced(rows div 4)
-    sides = @[(right, 1), (left, -1)]
-  else:
-    sides = @[(Node(name: tree.name, isDir: true, open: true, children: tree.children), side)]
-
-  budget = if side == 0: W div 2 - rootLen div 2 - 2 else: W - rootLen - 2
-  for (s, dir) in sides:
-    for c in s.children: c.setOpen(false)
-    if dense > 1: s.pack(-rootLen)
-    s.openToFit(rows, if wide: int.high div 4 else: budget)
+  var rootLen = -1
+  while tree.width > rootLen:
+    rootLen = tree.width
+    budget = if side == 0: W div 2 - rootLen div 2 - 2 else: W - rootLen - 2
+    sides = if side == 0: @[(sideOf(tree.children[mid .. ^1]), 1), (sideOf(tree.children[0 ..< mid]), -1)]
+            else: @[(sideOf(tree.children), side)]
+    for (s, _) in sides:
+      if dense > 1: s.pack(-rootLen)
+      if s.children.len > rows: s.trim(rows - 1 + ord(showHidden))
+    rootHidden = tree.total - sides.mapIt(it[0].children.mapIt(it.total).sum).sum
+  for (s, _) in sides: s.openToFit(rows, if wide: int.high div 4 else: budget)
   if wide:
     let need = sides.mapIt(it[0].extent(it[0].colWidths)).max
     W = if side == 0: 2 * need + 2 else: need + 1
@@ -510,7 +490,7 @@ proc main() =
     let top = if valign > 0: 0 elif valign < 0: H - s.height else: (H - s.height) div 2
     discard s.layout(0, s.colWidths, top, dir, if dir > 0: rootX0 else: rootX0 + rootLen)
   let full = sides.filterIt(it[0].kids.len > 0).mapIt(it[0])
-  var ry = sides.mapIt(it[0].y).foldl(a + b) div sides.len
+  var ry = sides.mapIt(it[0].y).sum div sides.len
   if valign == 0 and sides.len == 2 and full.len > 0:
     let lo = full.mapIt(it.kids[0].y).max
     let hi = full.mapIt(it.kids[^1].y).min
@@ -527,7 +507,7 @@ proc main() =
     let cut = if wide: toSeq(used[0] .. used[^1]).mapIt(grid[it].indent).min else: 0
     for y in used[0] .. used[^1]: echo grid[y][cut .. ^1].join("").strip(leading = false)
   if showInfo:
-    let shown = sides.mapIt(it[0].shownLeaves).foldl(a + b)
+    let shown = sides.mapIt(it[0].shownLeaves).sum
     let (dim, reset) = if color: (ansiStyleCode(styleDim), ansiResetCode) else: ("", "")
     echo dim, shown, " of ", seen, (if pending > 0: "+" else: ""), " files shown", reset
 
